@@ -307,7 +307,7 @@ export async function POST(request: Request) {
           
           // Stream the text generation using Groq's Kimi K2 Instruct model
           const result = streamText({
-            model: groq('moonshotai/kimi-k2-instruct'),
+            model: llm,
             messages: aiMessages,
             temperature: 0.7,
             maxRetries: 2
@@ -331,7 +331,7 @@ export async function POST(request: Request) {
             
           try {
             const followUpResponse = await generateText({
-              model: groq('moonshotai/kimi-k2-instruct'),
+              model: followUpLlm,
               messages: [
                 {
                   role: 'system',
