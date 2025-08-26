@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import { createGroq } from '@ai-sdk/groq'
 import { createAzure } from '@ai-sdk/azure'
+import { DefaultAzureCredential, getBearerTokenProvider } from "@azure/identity";
 import { streamText, generateText, createUIMessageStream, createUIMessageStreamResponse, convertToModelMessages } from 'ai'
 import type { ModelMessage, LanguageModel } from 'ai'
 import { detectCompanyTicker } from '@/lib/company-ticker-map'
@@ -41,22 +42,33 @@ export async function POST(request: Request) {
     let llm: LanguageModel
     let followUpLlm: LanguageModel
 
+
     if (aiProvider === 'azure') {
       const azureApiKey = process.env.AZURE_OPENAI_API_KEY
       const azureResourceName = process.env.AZURE_OPENAI_RESOURCE_NAME
       const azureDeploymentName = process.env.AZURE_OPENAI_DEPLOYMENT_NAME
       const azureApiVersion = process.env.AZURE_OPENAI_API_VERSION
+      const azureEndpoint = process.env.AZURE_OPENAI_ENDPOINT
 
-      if (!azureApiKey || !azureResourceName || !azureDeploymentName || !azureApiVersion) {
+      const credential = new DefaultAzureCredential();
+      const scope = 'https://cognitiveservices.azure.com/.default';
+      const azureADTokenProvider = getBearerTokenProvider(credential, scope);
+      const token = await azureADTokenProvider();
+      console.log("========== azureADTokenProvider: ", token)
+
+      if (!azureApiKey || !azureDeploymentName || !azureEndpoint) {
         return NextResponse.json({ error: 'Azure OpenAI environment variables not configured' }, { status: 500 })
       }
 
       const azure = createAzure({
-        apiKey: azureApiKey,
+        baseURL: azureEndpoint,
+        // apiKey: azureApiKey,
         resourceName: azureResourceName,
         apiVersion: azureApiVersion,
+        headers: {
+          'Authorization': `Bearer ${token}`
+        },
       })
-
       llm = azure(azureDeploymentName)
       followUpLlm = azure(azureDeploymentName)
 
@@ -69,6 +81,7 @@ export async function POST(request: Request) {
       llm = groq('moonshotai/kimi-k2-instruct')
       followUpLlm = groq('moonshotai/kimi-k2-instruct')
     }
+
 
     // Always perform a fresh search for each query to ensure relevant results
     const isFollowUp = messages.length > 2
@@ -262,6 +275,7 @@ export async function POST(request: Request) {
                 - For complex topics, provide detailed explanations only when needed
                 - Match the user's energy level - be brief if they're brief
                 
+
                 FORMAT:
                 - Use markdown for readability when appropriate
                 - Keep responses natural and conversational
@@ -312,13 +326,13 @@ export async function POST(request: Request) {
             temperature: 0.7,
             maxRetries: 2
           })
-          
+
           // Merge the AI stream into our UIMessage stream
           writer.merge(result.toUIMessageStream())
-          
+
           // Get the full answer for follow-up generation
           const fullAnswer = await result.text
-          
+
           // Generate follow-up questions
           const conversationPreview = isFollowUp 
             ? messages.map((m: { role: string; parts?: any[] }) => {
@@ -328,7 +342,7 @@ export async function POST(request: Request) {
                 return `${m.role}: ${content}`
               }).join('\n\n')
             : `user: ${query}`
-            
+
           try {
             const followUpResponse = await generateText({
               model: followUpLlm,
@@ -347,7 +361,7 @@ export async function POST(request: Request) {
               temperature: 0.7,
               maxRetries: 2
             })
-            
+
             // Process follow-up questions
             const followUpQuestions = followUpResponse.text
               .split('\n')
@@ -364,17 +378,18 @@ export async function POST(request: Request) {
           } catch (followUpError) {
             // Error generating follow-up questions
           }
-          
+
         } catch (error) {
-          
+          console.error('Error in search route:', error)
+
           // Handle specific error types
           const errorMessage = error instanceof Error ? error.message : 'Unknown error'
-          const statusCode = error && typeof error === 'object' && 'statusCode' in error 
-            ? error.statusCode 
+          const statusCode = error && typeof error === 'object' && 'statusCode' in error
+            ? error.statusCode
             : error && typeof error === 'object' && 'status' in error
             ? error.status
             : undefined
-          
+
           // Provide user-friendly error messages
           const errorResponses: Record<number, { error: string; suggestion?: string }> = {
             401: {
@@ -398,7 +413,7 @@ export async function POST(request: Request) {
           const errorResponse = statusCode && errorResponses[statusCode as keyof typeof errorResponses] 
             ? errorResponses[statusCode as keyof typeof errorResponses]
             : { error: errorMessage }
-          
+
           writer.write({
             type: 'data-error',
             id: 'error-1',
@@ -412,10 +427,11 @@ export async function POST(request: Request) {
         }
       }
     })
-    
+
     return createUIMessageStreamResponse({ stream })
-    
+
   } catch (error) {
+    console.error('Outer error in search route:', error)
     const errorMessage = error instanceof Error ? error.message : 'Unknown error'
     const errorStack = error instanceof Error ? error.stack : ''
     return NextResponse.json(
