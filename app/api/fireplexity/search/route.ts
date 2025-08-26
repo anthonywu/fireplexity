@@ -183,6 +183,7 @@ export async function POST(request: Request) {
           }).filter((item: { url: string; }) => item.url) || []
 
           // Transform image results - now with correct schema from direct API
+          imageResults = imagesData.map((item: ImageResult) => {
             // Verify we have the required fields
             if (!item.url || !item.imageUrl) {
               return null;
@@ -197,6 +198,7 @@ export async function POST(request: Request) {
               position: item.position
             };
           }).filter(Boolean) || []  // Filter out null entries
+
           // Send all sources as a persistent data part
           writer.write({
             type: 'data-sources',
@@ -207,7 +209,6 @@ export async function POST(request: Request) {
               imageResults
             }
           })
-          
 
           // Small delay to ensure sources render first
           await new Promise(resolve => setTimeout(resolve, 300))
