@@ -1,25 +1,25 @@
 import { NextResponse } from 'next/server'
 import { createGroq } from '@ai-sdk/groq'
+import { createAzure } from '@ai-sdk/azure'
 import { streamText, generateText, createUIMessageStream, createUIMessageStreamResponse, convertToModelMessages } from 'ai'
-import type { ModelMessage } from 'ai'
+import type { ModelMessage, LanguageModel } from 'ai'
 import { detectCompanyTicker } from '@/lib/company-ticker-map'
 import { selectRelevantContent } from '@/lib/content-selection'
+import { SearchResult, NewsResult, ImageResult } from './types'
 
 export async function POST(request: Request) {
-  const requestId = Math.random().toString(36).substring(7)
-  
   try {
     const body = await request.json()
     const messages = body.messages || []
-    
+
     // Extract query from v5 message structure (messages have parts array)
     let query = body.query
     if (!query && messages.length > 0) {
       const lastMessage = messages[messages.length - 1]
       if (lastMessage.parts) {
         // v5 structure
-        const textParts = lastMessage.parts.filter((p: any) => p.type === 'text')
-        query = textParts.map((p: any) => p.text).join(' ')
+        const textParts = lastMessage.parts.filter((p: Part) => p.type === 'text')
+        query = textParts.map((p: Part) => p.text).join(' ')
       } else if (lastMessage.content) {
         // Fallback for v4 structure
         query = lastMessage.content
@@ -32,24 +32,47 @@ export async function POST(request: Request) {
 
     // Use API key from request body if provided, otherwise fall back to environment variable
     const firecrawlApiKey = body.firecrawlApiKey || process.env.FIRECRAWL_API_KEY
-    const groqApiKey = process.env.GROQ_API_KEY
-    
     if (!firecrawlApiKey) {
       return NextResponse.json({ error: 'Firecrawl API key not configured' }, { status: 500 })
     }
-    
-    if (!groqApiKey) {
-      return NextResponse.json({ error: 'Groq API key not configured' }, { status: 500 })
-    }
 
-    // Configure Groq with the OSS 120B model
-    const groq = createGroq({
-      apiKey: groqApiKey
-    })
+    // AI Provider selection
+    const aiProvider = process.env.AI_PROVIDER || 'groq'
+    let llm: LanguageModel
+    let followUpLlm: LanguageModel
+
+    if (aiProvider === 'azure') {
+      const azureApiKey = process.env.AZURE_OPENAI_API_KEY
+      const azureResourceName = process.env.AZURE_OPENAI_RESOURCE_NAME
+      const azureDeploymentName = process.env.AZURE_OPENAI_DEPLOYMENT_NAME
+      const azureApiVersion = process.env.AZURE_OPENAI_API_VERSION
+
+      if (!azureApiKey || !azureResourceName || !azureDeploymentName || !azureApiVersion) {
+        return NextResponse.json({ error: 'Azure OpenAI environment variables not configured' }, { status: 500 })
+      }
+
+      const azure = createAzure({
+        apiKey: azureApiKey,
+        resourceName: azureResourceName,
+        apiVersion: azureApiVersion,
+      })
+
+      llm = azure(azureDeploymentName)
+      followUpLlm = azure(azureDeploymentName)
+
+    } else {
+      const groqApiKey = process.env.GROQ_API_KEY
+      if (!groqApiKey) {
+        return NextResponse.json({ error: 'Groq API key not configured' }, { status: 500 })
+      }
+      const groq = createGroq({ apiKey: groqApiKey })
+      llm = groq('moonshotai/kimi-k2-instruct')
+      followUpLlm = groq('moonshotai/kimi-k2-instruct')
+    }
 
     // Always perform a fresh search for each query to ensure relevant results
     const isFollowUp = messages.length > 2
-    
+
     // Create a UIMessage stream with custom data parts
     const stream = createUIMessageStream({
       originalMessages: messages,
@@ -85,7 +108,7 @@ export async function POST(request: Request) {
             position?: number
           }> = []
           let context = ''
-          
+
           // Send status updates as transient data parts
           writer.write({
             type: 'data-status',
@@ -93,14 +116,14 @@ export async function POST(request: Request) {
             data: { message: 'Starting search...' },
             transient: true
           })
-          
+
           writer.write({
             type: 'data-status',
             id: 'status-2',
             data: { message: 'Searching for relevant sources...' },
             transient: true
           })
-          
+
           // Make direct API call to Firecrawl v2 search endpoint
           const searchResponse = await fetch('https://api.firecrawl.dev/v2/search', {
             method: 'POST',
@@ -127,14 +150,14 @@ export async function POST(request: Request) {
 
           const searchResult = await searchResponse.json()
           const searchData = searchResult.data || {}
-          
+
           // Extract results from the v2 SDK response
-          const webResults = searchData.web || []
-          const newsData = searchData.news || []
-          const imagesData = searchData.images || []
-          
+          const webResults: WebResult[] = searchData.web || []
+          const newsData: NewsResult[] = searchData.news || []
+          const imagesData: ImageResult[] = searchData.images || []
+
           // Transform web sources metadata
-          sources = webResults.map((item: any) => {
+          sources = webResults.map((item: WebResult) => {
             return {
               url: item.url,
               title: item.title || item.url,
@@ -142,25 +165,24 @@ export async function POST(request: Request) {
               content: item.content,
               markdown: item.markdown,
               favicon: item.favicon,
-              image: item.ogImage || item.image || item.metadata?.ogImage,  // Add ogImage support
+              image: item.ogImage || item.image || item.metadata?.ogImage,
               siteName: new URL(item.url).hostname
             };
-          }).filter((item: any) => item.url) || []
+          }).filter((item: { url: string; }) => item.url) || []
 
           // Transform news results - now with correct schema
-          newsResults = newsData.map((item: any) => {
+          newsResults = newsData.map((item: NewsResult) => {
             return {
               url: item.url,
               title: item.title,
               description: item.snippet || item.description,
-              publishedDate: item.date,  // Direct API returns 'date' field
+              publishedDate: item.date,
               source: item.source || (item.url ? new URL(item.url).hostname : undefined),
-              image: item.imageUrl  // Direct API returns 'imageUrl' for news thumbnails
+              image: item.imageUrl
             };
-          }).filter((item: any) => item.url) || []
+          }).filter((item: { url: string; }) => item.url) || []
 
           // Transform image results - now with correct schema from direct API
-          imageResults = imagesData.map((item: any) => {
             // Verify we have the required fields
             if (!item.url || !item.imageUrl) {
               return null;
@@ -175,7 +197,6 @@ export async function POST(request: Request) {
               position: item.position
             };
           }).filter(Boolean) || []  // Filter out null entries
-          
           // Send all sources as a persistent data part
           writer.write({
             type: 'data-sources',
@@ -187,9 +208,10 @@ export async function POST(request: Request) {
             }
           })
           
+
           // Small delay to ensure sources render first
           await new Promise(resolve => setTimeout(resolve, 300))
-          
+
           // Update status
           writer.write({
             type: 'data-status',
@@ -197,7 +219,7 @@ export async function POST(request: Request) {
             data: { message: 'Analyzing sources and generating answer...' },
             transient: true
           })
-          
+
           // Detect if query is about a company
           const ticker = detectCompanyTicker(query)
           if (ticker) {
@@ -207,7 +229,7 @@ export async function POST(request: Request) {
               data: { symbol: ticker }
             })
           }
-          
+
           // Prepare context from sources with intelligent content selection
           context = sources
             .map((source: { title: string; markdown?: string; content?: string; url: string }, index: number) => {
@@ -217,10 +239,10 @@ export async function POST(request: Request) {
             })
             .join('\n\n---\n\n')
 
-          
+
           // Prepare messages for the AI
           let aiMessages: ModelMessage[] = []
-          
+
           if (!isFollowUp) {
             // Initial query with sources
             aiMessages = [
