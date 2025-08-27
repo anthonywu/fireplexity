@@ -1,11 +1,15 @@
 import { NextResponse } from 'next/server'
 import { createGroq } from '@ai-sdk/groq'
+import { ollama } from 'ollama-ai-provider-v2'
 import { createAzure } from '@ai-sdk/azure'
+import { createOllama } from 'ollama-ai-provider-v2'
 import { streamText, generateText, createUIMessageStream, createUIMessageStreamResponse, convertToModelMessages } from 'ai'
 import type { ModelMessage, LanguageModel } from 'ai'
 import { detectCompanyTicker } from '@/lib/company-ticker-map'
 import { selectRelevantContent } from '@/lib/content-selection'
 import { SearchResult, NewsResult, ImageResult } from './types'
+// import { openai } from '@ai-sdk/openai';
+import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 
 export async function POST(request: Request) {
   try {
@@ -41,23 +45,60 @@ export async function POST(request: Request) {
     let llm: LanguageModel
     let followUpLlm: LanguageModel
 
-    if (aiProvider === 'azure') {
+    if (aiProvider === 'ollama-openai') {
+      const ollamaModel = process.env.OLLAMA_MODEL
+      const ollamaHost = process.env.OLLAMA_HOST || "http://localhost:11434"
+      llm = createOpenAICompatible({
+        name: 'ollama',
+        baseURL: `${ollamaHost}/v1`,
+        apiKey: "notneeded"        
+      })
+      llm = createOpenAICompatible({
+        name: 'ollama',
+        baseURL: `${ollamaHost}/v1`,
+        apiKey: "notneeded"        
+      })
+    } else if (aiProvider === 'ollama') {
+      const ollamaModel = process.env.OLLAMA_MODEL
+      const ollamaHost = process.env.OLLAMA_HOST || "http://localhost:11434"
+      const resolveHost = ollamaHost.startsWith('http') ? ollamaHost : `http://${ollamaHost}`
+      const resolveBaseURL = resolveHost.endsWith("/api") ? resolveHost : `${resolveHost}/api`
+      const ollamaProvider = createOllama({
+        baseURL: resolveBaseURL
+      })
+      console.log(`Ollama API URL: ${resolveBaseURL} Model ${ollamaModel}`)
+      llm = ollamaProvider(ollamaModel)
+      console.log(llm)
+      followUpLlm = ollamaProvider(ollamaModel)
+    } else if (aiProvider === 'azure') {
       const azureApiKey = process.env.AZURE_OPENAI_API_KEY
-      const azureResourceName = process.env.AZURE_OPENAI_RESOURCE_NAME
       const azureDeploymentName = process.env.AZURE_OPENAI_DEPLOYMENT_NAME
+      const azureResourceName = process.env.AZURE_OPENAI_RESOURCE_NAME
+      const azureAiFoundryEndpoint = process.env.AZURE_AI_FOUNDRY_ENDPOINT
       const azureApiVersion = process.env.AZURE_OPENAI_API_VERSION
+      if (azureAiFoundryEndpoint) {
+        console.log(`Using Azure AI Foundry Endpoint: ${azureAiFoundryEndpoint}`)
+      } else {
+        console.log(`Using Azure Resource Name: ${azureResourceName}`)
+      }
+      console.log(`azureDeploymentName=${azureDeploymentName}`)
+      console.log(`azureApiVersion=${azureApiVersion}`)
 
-      if (!azureApiKey || !azureResourceName || !azureDeploymentName || !azureApiVersion) {
+      if (!azureApiKey || !azureDeploymentName || !azureApiVersion) {
         return NextResponse.json({ error: 'Azure OpenAI environment variables not configured' }, { status: 500 })
       }
 
+      // https://github.com/vercel/ai/blob/106baa7f7da379c78f97badf2efabaecac82ad32/packages/azure/src/azure-openai-provider.ts#L124
       const azure = createAzure({
         apiKey: azureApiKey,
+        baseUrl: azureAiFoundryEndpoint,
+        useDeploymentBasedUrls: true,
         resourceName: azureResourceName,
-        apiVersion: azureApiVersion,
+        deploymentName: azureDeploymentName
       })
 
-      llm = azure(azureDeploymentName)
+      llm = azure(azureDeploymentName)  // e.g. gpt-5-mini | gpt-oss-120b
+      console.log(llm)
       followUpLlm = azure(azureDeploymentName)
 
     } else {
@@ -125,7 +166,7 @@ export async function POST(request: Request) {
           })
 
           // Make direct API call to Firecrawl v2 search endpoint
-          const searchResponse = await fetch('https://api.firecrawl.dev/v2/search', {
+          const searchResponse = await fetch('http://localhost:8001/v2/search', {
             method: 'POST',
             headers: {
               'Authorization': `Bearer ${firecrawlApiKey}`,
@@ -134,7 +175,7 @@ export async function POST(request: Request) {
             body: JSON.stringify({
               query: query,
               sources: ['web', 'news', 'images'],
-              limit: 6,
+              limit: 4,
               scrapeOptions: {
                 formats: ['markdown'],
                 onlyMainContent: true,
@@ -156,8 +197,24 @@ export async function POST(request: Request) {
           const newsData: NewsResult[] = searchData.news || []
           const imagesData: ImageResult[] = searchData.images || []
 
+          webResults.forEach((item, index) => {
+            // console.log(`WebResult[${index}] properties:`, item);
+          });
           // Transform web sources metadata
-          sources = webResults.map((item: WebResult) => {
+          const cleanWebResults = webResults.filter((item: WebResult) => {
+            try {
+              if (item.metadata?.statusCode && item.metadata.statusCode > 400) {
+                console.warn(`Skipping web search result for URL: ${item.url} due to HTTP status code: ${item.metadata.statusCode}`);
+                return false; // Skip this item
+              }
+              return true; // Keep this item if no status code or status code <= 400
+            } catch (error) {
+              console.error(`Error checking status code for web search result URL: ${item.url}. Skipping item.`, error);
+              return false; // Skip on any error during metadata access
+            }
+          });
+          sources = cleanWebResults.map((item: WebResult) => {
+            console.log(`item url: ${item.url}`)            
             return {
               url: item.url,
               title: item.title || item.url,
@@ -306,12 +363,14 @@ export async function POST(request: Request) {
           }
           
           // Stream the text generation using Groq's Kimi K2 Instruct model
+          console.log("1 // streaming text to llm...")
           const result = streamText({
             model: llm,
             messages: aiMessages,
             temperature: 0.7,
             maxRetries: 2
           })
+          console.log("2 // writing results text to message stream...")
           
           // Merge the AI stream into our UIMessage stream
           writer.merge(result.toUIMessageStream())
@@ -366,7 +425,7 @@ export async function POST(request: Request) {
           }
           
         } catch (error) {
-          
+          console.error("Error in POST request:", error);
           // Handle specific error types
           const errorMessage = error instanceof Error ? error.message : 'Unknown error'
           const statusCode = error && typeof error === 'object' && 'statusCode' in error 
@@ -416,6 +475,7 @@ export async function POST(request: Request) {
     return createUIMessageStreamResponse({ stream })
     
   } catch (error) {
+    console.error("Error in POST request:", error);
     const errorMessage = error instanceof Error ? error.message : 'Unknown error'
     const errorStack = error instanceof Error ? error.stack : ''
     return NextResponse.json(
